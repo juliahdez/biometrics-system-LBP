@@ -22,7 +22,20 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
+# Límite de píxeles al decodificar (evita "bombas de descompresión": un PNG
+# pequeño que al abrirse ocupa gigas). Debe fijarse antes de importar cv2.
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(40_000_000))
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")   # sin avisos internos de OpenCV 5
+
+import io  # noqa: E402
+
+import cv2  # noqa: E402
+from PIL import Image  # noqa: E402
+
+try:  # por si cv2 ya estaba importado antes que este módulo
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except AttributeError:
+    pass
 import numpy as np
 
 # --------------------------------------------------------------------------- #
@@ -30,13 +43,14 @@ import numpy as np
 # --------------------------------------------------------------------------- #
 RUTA_MODELO = Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx"
 
-UMBRAL_CONFIANZA = 0.8      # detecciones por debajo se descartan
+UMBRAL_CONFIANZA = 0.7      # detecciones por debajo se descartan (0.8 perdía caras muy cercanas)
 UMBRAL_NMS = 0.3            # solapamiento máximo entre detecciones
 LADO_MAX_DETECCION = 1280   # imágenes más grandes se reducen para detectar
 TAM_MIN_IMAGEN = 32         # lado mínimo (px) aceptado de la imagen
 TAM_MIN_CARA = 24           # lado mínimo (px) de una cara válida
 MAX_PIXELES = 40_000_000    # protección contra imágenes gigantes (DoS)
 MAX_BYTES = 25 * 1024 * 1024
+Image.MAX_IMAGE_PIXELS = None   # el límite lo aplica _comprobar_cabecera (sin avisos de Pillow)
 
 
 # --------------------------------------------------------------------------- #
@@ -99,8 +113,15 @@ def cargar_imagen(foto) -> np.ndarray:
     if isinstance(foto, (bytes, bytearray, memoryview)):
         if len(foto) == 0 or len(foto) > MAX_BYTES:
             raise ImagenInvalidaError("Tamaño de fichero no válido")
-        buf = np.frombuffer(bytes(foto), dtype=np.uint8)
-        img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        datos = bytes(foto)
+        _comprobar_cabecera(datos)          # dimensiones ANTES de decodificar
+        buf = np.frombuffer(datos, dtype=np.uint8)
+        # IMREAD_COLOR aplica la orientación EXIF (fotos de móvil giradas)
+        # y convierte gris / 16 bits / alfa a BGR de 8 bits.
+        try:
+            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        except cv2.error:
+            img = None
         if img is None:
             raise ImagenInvalidaError("No se pudo decodificar la imagen (formato no soportado o corrupta)")
     elif isinstance(foto, np.ndarray):
@@ -108,6 +129,9 @@ def cargar_imagen(foto) -> np.ndarray:
     else:
         raise ImagenInvalidaError(f"Tipo de entrada no soportado: {type(foto).__name__}")
 
+    if not (np.issubdtype(img.dtype, np.integer) or np.issubdtype(img.dtype, np.floating)) \
+            or img.dtype == np.bool_:
+        raise ImagenInvalidaError(f"Tipo de dato de imagen no soportado: {img.dtype}")
     if img.size == 0 or img.ndim not in (2, 3):
         raise ImagenInvalidaError(f"Forma de imagen no válida: {img.shape}")
     h, w = img.shape[:2]
@@ -116,24 +140,45 @@ def cargar_imagen(foto) -> np.ndarray:
     if min(h, w) < TAM_MIN_IMAGEN:
         raise ImagenInvalidaError(f"Imagen demasiado pequeña: {w}x{h}")
 
-    # Normalizar tipo de dato a uint8
-    if img.dtype != np.uint8:
-        if np.issubdtype(img.dtype, np.floating):
-            if not np.isfinite(img).all():
-                raise ImagenInvalidaError("La imagen contiene NaN o infinitos")
-            img = np.clip(img * 255.0 if img.max() <= 1.0 else img, 0, 255).astype(np.uint8)
-        else:
-            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    try:
+        # Normalizar tipo de dato a uint8
+        if img.dtype != np.uint8:
+            if np.issubdtype(img.dtype, np.floating):
+                if not np.isfinite(img).all():
+                    raise ImagenInvalidaError("La imagen contiene NaN o infinitos")
+                img = np.clip(img * 255.0 if img.max() <= 1.0 else img, 0, 255).astype(np.uint8)
+            else:
+                img = cv2.normalize(img.astype(np.float64), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # Normalizar canales a BGR
-    if img.ndim == 2 or img.shape[2] == 1:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    elif img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    elif img.shape[2] != 3:
-        raise ImagenInvalidaError(f"Número de canales no soportado: {img.shape[2]}")
+        # Normalizar canales a BGR
+        if img.ndim == 2 or img.shape[2] == 1:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        elif img.shape[2] != 3:
+            raise ImagenInvalidaError(f"Número de canales no soportado: {img.shape[2]}")
+    except cv2.error:
+        raise ImagenInvalidaError("No se pudo convertir la imagen") from None
 
     return np.ascontiguousarray(img)
+
+
+def _comprobar_cabecera(datos: bytes) -> None:
+    """Lee SOLO la cabecera (sin decodificar píxeles) y rechaza imágenes enormes.
+
+    El límite de OpenCV (OPENCV_IO_MAX_IMAGE_PIXELS) no basta: OpenCV lo lee al
+    importarse, y si otro módulo importa cv2 antes que este, se queda su límite por
+    defecto (2^30 px). Un PNG de 600 KB de 25000x25000 llegaba a gastar 3,7 GB.
+    """
+    try:
+        with Image.open(io.BytesIO(datos)) as im:
+            ancho, alto = im.size
+    except Image.DecompressionBombError:
+        raise ImagenInvalidaError("Imagen demasiado grande") from None
+    except Exception:  # noqa: BLE001 - Pillow lanza tipos variados con datos basura
+        raise ImagenInvalidaError("No se pudo decodificar la imagen (formato no soportado o corrupta)") from None
+    if ancho * alto > MAX_PIXELES:
+        raise ImagenInvalidaError(f"Imagen demasiado grande: {ancho}x{alto}")
 
 
 # --------------------------------------------------------------------------- #

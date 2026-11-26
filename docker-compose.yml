@@ -1,0 +1,17 @@
+# Uso:  docker compose run --rm biometria <orden> [argumentos]
+#   docker compose run --rm biometria inscribir_carpeta /fotos
+#   docker compose run --rm biometria verificar "Angelina Jolie" /fotos/prueba.jpg
+#
+# Linux / macOS: crear las carpetas ANTES del primer uso (si no, Docker las crea como
+# root y el contenedor no puede escribir en ellas):
+#   mkdir -p datos secretos fotos
+# Si vuestro usuario de Linux no es el 1000 (comprobadlo con: id -u):
+#   docker compose run --rm --user "$(id -u):$(id -g)" biometria listar
+services:
+  biometria:
+    build: .
+    image: biometria-lbp
+    volumes:
+      - ./datos:/app/datos            # bd.csv (con su firma en la última línea)
+      - ./secretos:/app/secretos      # clave.key + versiones.json + intentos.json
+      - ./fotos:/fotos:ro             # fotos de entrada (solo lectura)

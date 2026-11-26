@@ -1,16 +1,14 @@
 """
 Cadena completa: foto -> detector -> preprocesado -> LBP -> template.
 
-    obtener_template(foto)              con detector (para inscribir / verificar / identificar)
-    obtener_template_sd(foto)           sin detector (para los métodos _sd)
+    obtener_template(foto)       con detector    (inscribir / verificar / identificar)
+    obtener_template_sd(foto)    sin detector    (inscribir_sd / verificar_sd / identificar_sd)
 """
 from __future__ import annotations
 
-import cv2
-
 from detector import cargar_imagen, detectar
-from lbp import comparar, extraer  # noqa: F401  (se reexporta comparar)
-from preprocesado import TAM_CARA, preprocesar, _clahe
+from lbp import comparar, extraer  # noqa: F401  (comparar se reexporta)
+from preprocesado import preprocesar, preprocesar_sin_detector
 
 
 def obtener_template(foto):
@@ -20,8 +18,5 @@ def obtener_template(foto):
 
 
 def obtener_template_sd(foto):
-    """Sin detector: se asume que la foto ya es la cara recortada."""
-    img = cargar_imagen(foto)
-    gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    cara = cv2.resize(gris, (TAM_CARA, TAM_CARA), interpolation=cv2.INTER_AREA)
-    return extraer(_clahe.apply(cara))
+    """Sin detector: la foto se trata como el recorte de la cara (la caja del detector)."""
+    return extraer(preprocesar_sin_detector(foto))

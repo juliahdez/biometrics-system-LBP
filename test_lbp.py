@@ -7,7 +7,8 @@ from skimage import data
 from detector import detectar
 from lbp import N_CASILLAS, TAM_TEMPLATE, ErrorTemplate, comparar, extraer, validar_template
 from pipeline import obtener_template, obtener_template_sd
-from preprocesado import preprocesar
+from preprocesado import (OJO_DER_DESTINO, OJO_IZQ_DESTINO, ErrorPreprocesado, preprocesar,
+                          preprocesar_sin_detector)
 
 CARA = cv2.cvtColor(data.astronaut(), cv2.COLOR_RGB2BGR)
 
@@ -25,13 +26,19 @@ def test_preprocesado_forma_y_tipo():
 
 
 def test_preprocesado_pone_los_ojos_en_su_sitio():
-    """Tras alinear, el detector debe encontrar los ojos cerca de (38, 46) y (90, 46)."""
+    """Tras alinear, los ojos deben quedar cerca de su posición destino."""
     cara = preprocesar(CARA, *detectar(CARA))
-    grande = cv2.resize(cv2.cvtColor(cara, cv2.COLOR_GRAY2BGR), (512, 512))
-    _, oi, od = detectar(np.pad(grande, ((128, 128), (128, 128), (0, 0))))
-    oi = (np.array(oi) - 128) / 4
-    od = (np.array(od) - 128) / 4
-    assert np.allclose(oi, (38.4, 46.1), atol=6) and np.allclose(od, (89.6, 46.1), atol=6)
+    # Para volver a detectar, se reconstruye una cara "normal" sin Tan-Triggs
+    caja, oi, od = detectar(CARA)
+    from preprocesado import _matriz_semejanza
+    gris = cv2.warpAffine(CARA, _matriz_semejanza(oi, od, 128), (128, 128))
+    grande = cv2.resize(gris, (512, 512))
+    _, oi2, od2 = detectar(np.pad(grande, ((128, 128), (128, 128), (0, 0))))
+    oi2 = (np.array(oi2) - 128) / 4
+    od2 = (np.array(od2) - 128) / 4
+    assert np.allclose(oi2, np.array(OJO_IZQ_DESTINO) * 128, atol=6)
+    assert np.allclose(od2, np.array(OJO_DER_DESTINO) * 128, atol=6)
+    assert cara.std() > 20
 
 
 def test_ojos_absurdos_usa_la_caja():
@@ -40,10 +47,15 @@ def test_ojos_absurdos_usa_la_caja():
     assert cara.shape == (128, 128)
 
 
+def test_imagen_lisa_se_rechaza():
+    with pytest.raises(ErrorPreprocesado):
+        preprocesar_sin_detector(np.full((200, 200, 3), 128, np.uint8))
+
+
 # ---------------------------------------------------------------- extractor
 def test_template_formato():
     t = obtener_template(CARA)
-    assert t.shape == (TAM_TEMPLATE,) and t.dtype == np.float32
+    assert t.shape == (TAM_TEMPLATE,) == (5900,) and t.dtype == np.float32
     validar_template(t)
 
 
@@ -51,10 +63,10 @@ def test_mismo_template_misma_foto():
     assert comparar(obtener_template(CARA), obtener_template(CARA)) == 0.0
 
 
-def test_genuino_mas_cerca_que_otra_cara():
+def test_genuino_mas_cerca_que_otra_zona():
     t = obtener_template(CARA)
     t_var = obtener_template(variante(CARA, angulo=5, brillo=0.8, desplaz=4))
-    # misma foto pero "alineando" con los ojos sobre la boca -> otra cara distinta
+    # misma foto pero "alineando" con los ojos sobre la boca -> otra textura distinta
     t_otra = extraer(preprocesar(CARA, (178, 63, 90, 113), (200, 160), (247, 160)))
     assert comparar(t, t_var) < comparar(t, t_otra)
 
@@ -62,7 +74,14 @@ def test_genuino_mas_cerca_que_otra_cara():
 def test_invariante_a_brillo_global():
     t1 = obtener_template(CARA)
     t2 = obtener_template(variante(CARA, brillo=0.6))
-    assert comparar(t1, t2) < 0.3
+    assert comparar(t1, t2) < 0.15
+
+
+def test_template_simetrico_igual_en_espejo():
+    """El template es simétrico: la foto en espejo da (casi) el mismo template."""
+    t1 = obtener_template(CARA)
+    t2 = obtener_template(cv2.flip(CARA, 1))
+    assert comparar(t1, t2) < 0.15
 
 
 def test_extraer_rechaza_entradas_malas():
@@ -72,11 +91,12 @@ def test_extraer_rechaza_entradas_malas():
             extraer(mala)
 
 
-def test_sin_detector():
+def test_sin_detector_coherente_con_detector():
+    """Con la caja del detector, la vía _sd da un template parecido al de la vía normal."""
     caja, _, _ = detectar(CARA)
     x, y, w, h = caja
-    t = obtener_template_sd(CARA[y:y + h, x:x + w])
-    assert t.shape == (TAM_TEMPLATE,)
+    t_sd = obtener_template_sd(CARA[y:y + h, x:x + w])
+    assert comparar(obtener_template(CARA), t_sd) < 0.3
 
 
 # ---------------------------------------------------------------- templates manipulados (_t)
@@ -85,8 +105,9 @@ def test_sin_detector():
     np.ones(TAM_TEMPLATE),                                # no normalizado
     np.zeros(10),                                         # tamaño incorrecto
     np.full(TAM_TEMPLATE, np.nan),                        # NaN
-    -obtener_template(CARA),                              # negativos
-    "texto", None, [[1, 2], [3, 4]],
+    np.full(TAM_TEMPLATE, np.inf),                        # infinito
+    -np.full(TAM_TEMPLATE, 1 / N_CASILLAS),               # negativos
+    "texto", None, [[1, 2], [3, 4]], b"\x00" * 100,
 ])
 def test_templates_manipulados_se_rechazan(malo):
     with pytest.raises(ErrorTemplate):

@@ -1,7 +1,10 @@
-opencv-python-headless>=4.8
-numpy
-scikit-image
-# opcional: gráficas de evaluar.py
-matplotlib
-# solo para las pruebas
-pytest
+opencv-python-headless>=4.8,<6
+numpy>=1.24
+scikit-image>=0.21
+# lectura de cabeceras de imagen (ya la trae scikit-image, pero se usa directamente)
+pillow>=10
+cryptography>=41
+# gráficas de evaluar.py
+matplotlib>=3.7
+# pruebas
+pytest>=7

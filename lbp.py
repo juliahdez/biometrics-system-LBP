@@ -1,82 +1,103 @@
 """
 Extractor de características LBP (Local Binary Patterns) y comparación.
 
-Interfaz acordada:
-    extraer(cara) -> template          (vector float32)
-    comparar(t1, t2) -> distancia      (chi-cuadrado, 0 = idénticos)
+    extraer(cara) -> template            vector float32 de TAM_TEMPLATE valores
+    comparar(t1, t2) -> distancia        chi-cuadrado (0 = idénticos, 2 = nada en común)
+    validar_template(t) -> np.ndarray    rechaza templates con formato incorrecto
 
-Método (Ahonen et al., 2006):
-  1. Para cada píxel se comparan sus P vecinos en un círculo de radio R:
-     vecino >= centro -> 1, si no -> 0. Los P bits forman un código.
-  2. Se usan solo los patrones "uniformes" (como mucho 2 cambios 0->1 / 1->0),
-     que son los que aparecen en bordes, esquinas y manchas; el resto se agrupan
-     en una sola casilla. Con P=8 salen 59 casillas.
-  3. La cara se divide en una rejilla y se calcula un histograma por celda,
-     para no perder DÓNDE está cada textura (ojos, boca...).
-  4. El template es la concatenación de los histogramas normalizados.
+Método (Ahonen, Hadid y Pietikäinen, 2006):
+  1. Cada píxel se compara con P=8 vecinos en un círculo de radio R=2:
+     vecino >= centro -> 1, si no -> 0. Los 8 bits forman un código de textura.
+  2. Solo se distinguen los patrones "uniformes" (como mucho 2 cambios 0<->1): bordes,
+     esquinas, manchas... El resto va a una casilla común. Con P=8 salen 59 casillas.
+  3. La cara se divide en una rejilla de 10x10 celdas y se hace un histograma por
+     celda, para conservar DÓNDE está cada textura.
+  4. Template simétrico: se promedian los histogramas de la cara y de su imagen en
+     espejo. Así el template es menos sensible a giros leves y a la luz lateral.
+  5. Template = concatenación de los 100 histogramas normalizados (100 x 59 = 5900).
 """
 from __future__ import annotations
 
+import cv2
 import numpy as np
 from skimage.feature import local_binary_pattern
 
-# Parámetros (ajustados con evaluar.py)
-PUNTOS = 8          # P: vecinos
-RADIO = 2           # R: radio del círculo
-REJILLA = (8, 8)    # celdas (filas, columnas)
+PUNTOS = 8
+RADIO = 2
+REJILLA = 10
 TAM_CARA = 128
+SIMETRICO = True
 
-N_CASILLAS = PUNTOS * (PUNTOS - 1) + 3          # 59 con P=8 ("nri_uniform")
-TAM_TEMPLATE = REJILLA[0] * REJILLA[1] * N_CASILLAS
+N_CASILLAS = PUNTOS * (PUNTOS - 1) + 3          # 59
+N_CELDAS = REJILLA * REJILLA                    # 100
+TAM_TEMPLATE = N_CELDAS * N_CASILLAS            # 5900
+_BORDES = np.linspace(0, TAM_CARA, REJILLA + 1).round().astype(int)
 
 
-class ErrorTemplate(Exception):
+class ErrorTemplate(ValueError):
     pass
 
 
+def _histogramas(cara: np.ndarray) -> np.ndarray:
+    codigos = local_binary_pattern(cara, PUNTOS, RADIO, method="nri_uniform").astype(np.int64)
+    histos = np.empty((N_CELDAS, N_CASILLAS))
+    k = 0
+    for i in range(REJILLA):
+        for j in range(REJILLA):
+            celda = codigos[_BORDES[i]:_BORDES[i + 1], _BORDES[j]:_BORDES[j + 1]]
+            h = np.bincount(celda.ravel(), minlength=N_CASILLAS).astype(np.float64)
+            histos[k] = h / h.sum()
+            k += 1
+    return histos
+
+
 def extraer(cara: np.ndarray) -> np.ndarray:
-    """cara: 128x128 uint8 en gris (salida de preprocesar)."""
+    """cara: 128x128 uint8 en gris (salida del preprocesado)."""
     if not isinstance(cara, np.ndarray) or cara.shape != (TAM_CARA, TAM_CARA):
         raise ErrorTemplate(f"La cara debe ser un array {TAM_CARA}x{TAM_CARA} en gris, "
                             f"no {getattr(cara, 'shape', type(cara).__name__)}")
     if cara.dtype != np.uint8:
         raise ErrorTemplate(f"La cara debe ser uint8, no {cara.dtype}")
-
-    codigos = local_binary_pattern(cara, PUNTOS, RADIO, method="nri_uniform")
-
-    filas, cols = REJILLA
-    alto, ancho = TAM_CARA // filas, TAM_CARA // cols
-    histos = []
-    for i in range(filas):
-        for j in range(cols):
-            celda = codigos[i * alto:(i + 1) * alto, j * ancho:(j + 1) * ancho]
-            h = np.bincount(celda.ravel().astype(np.int64), minlength=N_CASILLAS).astype(np.float64)
-            histos.append(h / h.sum())           # cada celda suma 1
-    return np.concatenate(histos).astype(np.float32)
+    h = _histogramas(cara)
+    if SIMETRICO:
+        h = (h + _histogramas(cv2.flip(cara, 1))) / 2
+    return h.ravel().astype(np.float32)
 
 
 def validar_template(t) -> np.ndarray:
-    """Comprueba que un template tiene el formato correcto (clave para los métodos _t)."""
+    """Comprueba que un template tiene exactamente el formato que produce extraer().
+
+    Es la defensa de los métodos _t: un atacante no puede meter vectores de otro
+    tamaño, con NaN/infinitos, negativos o histogramas que no sumen 1.
+    """
+    if isinstance(t, (str, bytes)) or t is None:
+        raise ErrorTemplate("El template debe ser un vector numérico")
     try:
         t = np.asarray(t, dtype=np.float64)
     except (TypeError, ValueError):
-        raise ErrorTemplate("El template no es numérico")
+        raise ErrorTemplate("El template no es numérico") from None
     if t.shape != (TAM_TEMPLATE,):
         raise ErrorTemplate(f"Tamaño de template incorrecto: {t.shape}, se esperaba ({TAM_TEMPLATE},)")
     if not np.isfinite(t).all():
         raise ErrorTemplate("El template contiene NaN o infinitos")
     if (t < 0).any() or (t > 1).any():
         raise ErrorTemplate("El template tiene valores fuera de [0, 1]")
-    sumas = t.reshape(-1, N_CASILLAS).sum(axis=1)
+    sumas = t.reshape(N_CELDAS, N_CASILLAS).sum(axis=1)
     if not np.allclose(sumas, 1.0, atol=1e-3):
-        raise ErrorTemplate("Los histogramas del template no están normalizados")
+        raise ErrorTemplate("Los histogramas del template no están normalizados (cada celda debe sumar 1)")
     return t
 
 
+def distancias(t, matriz: np.ndarray) -> np.ndarray:
+    """Distancia chi-cuadrado de un template contra una matriz de templates (N x TAM)."""
+    t = validar_template(t)
+    m = np.asarray(matriz, dtype=np.float64).reshape(-1, TAM_TEMPLATE)
+    suma = t + m
+    dif2 = (t - m) ** 2
+    chi2 = np.divide(dif2, suma, out=np.zeros_like(dif2), where=suma > 0)
+    return chi2.sum(axis=1) / N_CELDAS
+
+
 def comparar(t1, t2) -> float:
-    """Distancia chi-cuadrado media por celda. 0 = idénticos, 2 = nada en común."""
-    a, b = validar_template(t1), validar_template(t2)
-    suma = a + b
-    mascara = suma > 0
-    chi2 = ((a - b) ** 2)[mascara] / suma[mascara]
-    return float(chi2.sum() / (REJILLA[0] * REJILLA[1]))
+    """Distancia chi-cuadrado media por celda: 0 = idénticos ... 2 = nada en común."""
+    return float(distancias(t1, validar_template(t2)[None, :])[0])

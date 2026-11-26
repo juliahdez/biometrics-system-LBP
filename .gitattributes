@@ -1,0 +1,11 @@
+# La BD va firmada. El código ya tolera CRLF, pero mejor que git no toque estos ficheros.
+datos/**        -text
+# La clave y los contadores: sin conversiones.
+secretos/**     binary
+
+# Binarios del proyecto
+*.npy           binary
+*.onnx          binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
